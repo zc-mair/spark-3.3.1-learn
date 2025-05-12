@@ -132,6 +132,7 @@ private[spark] class TaskSetManager(
   private var totalResultSize = 0L
   private var calculatedTasks = 0
 
+  //判断是否需要应用黑名单规则
   private[scheduler] val taskSetExcludelistHelperOpt: Option[TaskSetExcludelist] = {
     healthTracker.map { _ =>
       new TaskSetExcludelist(sched.sc.listenerBus, conf, stageId, taskSet.stageAttemptId, clock)
@@ -228,6 +229,9 @@ private[spark] class TaskSetManager(
    * the set of currently available executors.  This is updated as executors are added and removed.
    * This allows a performance optimization, of skipping levels that aren't relevant (e.g., skip
    * PROCESS_LOCAL if no tasks could be run PROCESS_LOCAL for the current set of executors).
+   *
+   * 任务调度遵循：多级本地性回退机制‌。当 myLocalityLevels 包含多个本地性级别时，调度器会按照优先级从高到低的顺序依次尝试分配任务
+   * 延迟调度（Delay Scheduling）：高优先级本地性级别会优先分配，若当前资源无法满足，允许短暂等待而非立即降级，提升数据本地性
    */
   private[scheduler] var myLocalityLevels = computeValidLocalityLevels()
 
@@ -236,7 +240,7 @@ private[spark] class TaskSetManager(
   // We then move down if we manage to launch a "more local" task when resetting the timer
   private val legacyLocalityWaitReset = conf.get(LEGACY_LOCALITY_WAIT_RESET)
   private var currentLocalityIndex = 0 // Index of our current locality level in validLocalityLevels
-  private var lastLocalityWaitResetTime = clock.getTimeMillis()  // Time we last reset locality wait
+  private var lastLocalityWaitResetTime = clock.getTimeMillis()  // Time we last reset locality wait  // 记录进入当前本地性级别的时间点，用于计算累积等待时长
 
   // Time to wait at each level
   private[scheduler] var localityWaits = myLocalityLevels.map(getLocalityWait)
@@ -302,7 +306,7 @@ private[spark] class TaskSetManager(
       speculative: Boolean = false): Option[Int] = {
     var indexOffset = list.size
     while (indexOffset > 0) {
-      indexOffset -= 1
+      indexOffset -= 1  //逆序遍历
       val index = list(indexOffset)
       if (!isTaskExcludededOnExecOrNode(index, execId, host) &&
           !(speculative && hasAttemptOnHost(index, host))) {
@@ -310,10 +314,10 @@ private[spark] class TaskSetManager(
         list.remove(indexOffset)
         // Speculatable task should only be launched when at most one copy of the
         // original task is running
-        if (!successful(index)) {
-          if (copiesRunning(index) == 0 && !barrierPendingLaunchTasks.contains(index)) {
+        if (!successful(index)) {  //任务未运行成功
+          if (copiesRunning(index) == 0 && !barrierPendingLaunchTasks.contains(index)) {  //copiesRunning(index) == 0 表示：第一次运行
             return Some(index)
-          } else if (speculative && copiesRunning(index) == 1) {
+          } else if (speculative && copiesRunning(index) == 1) {  //如果推测开启，且已经存在一个正在运行的任务，那么可以再启动一个任务运行
             return Some(index)
           }
         }
@@ -431,29 +435,33 @@ private[spark] class TaskSetManager(
   def resourceOffer(
       execId: String,
       host: String,
-      maxLocality: TaskLocality.TaskLocality,
-      taskCpus: Int = sched.CPUS_PER_TASK,
-      taskResourceAssignments: Map[String, ResourceInformation] = Map.empty)
+      maxLocality: TaskLocality.TaskLocality,  //尝试从给定的Exector上运行指定的任务本地性的任务
+      taskCpus: Int = sched.CPUS_PER_TASK, //任务所需的 CPU 核数（默认从调度器配置读取）
+      taskResourceAssignments: Map[String, ResourceInformation] = Map.empty)  //任务的其他资源分配（如 GPU、FPGA 等）
     : (Option[TaskDescription], Boolean, Int) =
   {
+    // 判断是否需要应用黑名单规则
     val offerExcluded = taskSetExcludelistHelperOpt.exists { excludeList =>
-      excludeList.isNodeExcludedForTaskSet(host) ||
-        excludeList.isExecutorExcludedForTaskSet(execId)
+      excludeList.isNodeExcludedForTaskSet(host) ||   //host没有在黑名单
+        excludeList.isExecutorExcludedForTaskSet(execId)  //executor不在黑名单
     }
+    //任务集已标记为僵尸状态（不再接受新任务）
     if (!isZombie && !offerExcluded) {
-      val curTime = clock.getTimeMillis()
+      //
+      val curTime = clock.getTimeMillis()  //记录调度器当前检查本地性状态的时间点
 
       var allowedLocality = maxLocality
 
-      if (maxLocality != TaskLocality.NO_PREF) {
-        allowedLocality = getAllowedLocalityLevel(curTime)
+      if (maxLocality != TaskLocality.NO_PREF) { // 不允许 NO_PREF（无本地性偏好）
+        allowedLocality = getAllowedLocalityLevel(curTime) // 动态计算当前允许的本地性级别（基于延迟调度超时机制）
         if (allowedLocality > maxLocality) {
           // We're not allowed to search for farther-away tasks
-          allowedLocality = maxLocality
+          allowedLocality = maxLocality  // 不超过 maxLocality 约束
         }
       }
-
+      //存储选中任务在taskSet中的下标
       var dequeuedTaskIndex: Option[Int] = None
+//      从任务队列中选择符合 allowedLocality 的任务
       val taskDescription =
         dequeueTask(execId, host, allowedLocality)
           .map { case (index, taskLocality, speculative) =>
@@ -461,6 +469,7 @@ private[spark] class TaskSetManager(
             if (legacyLocalityWaitReset && maxLocality != TaskLocality.NO_PREF) {
               resetDelayScheduleTimer(Some(taskLocality))
             }
+            //如果是屏障任务，那么仅需要收集下任务，等所有任务运行完成后再一同提交
             if (isBarrier) {
               barrierPendingLaunchTasks(index) =
                 BarrierPendingLaunchTask(
@@ -472,6 +481,7 @@ private[spark] class TaskSetManager(
               // return null since the TaskDescription for the barrier task is not ready yet
               null
             } else {
+              //如果是非屏障任务，直接构造任务
               prepareLaunchingTask(
                 execId,
                 host,
@@ -484,10 +494,12 @@ private[spark] class TaskSetManager(
             }
           }
       val hasPendingTasks = pendingTasks.all.nonEmpty || pendingSpeculatableTasks.all.nonEmpty
-      val hasScheduleDelayReject =
+      val hasScheduleDelayReject =    // 延迟调度拒绝, 若资源为 ANY 本地性，但仍有挂起的 PROCESS_LOCAL 任务，说明可能等待更高本地性任务,若长期处于 RACK_LOCAL，可能数据分布不合理或本地性等待配置不当
         taskDescription.isEmpty &&
           maxLocality == TaskLocality.ANY &&
           hasPendingTasks
+       //延迟调度（Delay Scheduling）：高优先级本地性级别会优先分配，若当前资源无法满足，允许短暂等待而非立即降级，提升数据本地性
+      // 返回：（taskDescription:成功调度的任务描述、hasScheduleDelayReject:是否因延迟调度策略拒绝资源（需等待更高本地性任务）、dequeuedTaskIndex:取出任务在任务集中的索引）
       (taskDescription, hasScheduleDelayReject, dequeuedTaskIndex.getOrElse(-1))
     } else {
       (None, false, -1)
@@ -511,8 +523,8 @@ private[spark] class TaskSetManager(
     val attemptNum = taskAttempts(index).size
     val info = new TaskInfo(
       taskId, index, attemptNum, task.partitionId, launchTime,
-      execId, host, taskLocality, speculative)
-    taskInfos(taskId) = info
+      execId, host, taskLocality, speculative)  //index只代表了在TaskSet中的任务下标，不一定与分区号一致，比如 RDD.take(10)，那么即使RDD有100个分区，可能只处理前几个分区的数据
+    taskInfos(taskId) = info  //缓存此task信息到全局变量中
     taskAttempts(index) = info :: taskAttempts(index)
     // Serialize and return the task
     val serializedTask: ByteBuffer = try {
@@ -584,12 +596,23 @@ private[spark] class TaskSetManager(
   private def getAllowedLocalityLevel(curTime: Long): TaskLocality.TaskLocality = {
     // Remove the scheduled or finished tasks lazily
     def tasksNeedToBeScheduledFrom(pendingTaskIds: ArrayBuffer[Int]): Boolean = {
-      var indexOffset = pendingTaskIds.size
+      /**
+       * 为啥要逆序遍历：
+       * 假设初始数组为 [0, 1, 2, 3, 4]：
+       *
+       * ‌正向遍历‌（从 0 开始）：
+       *   删除索引 2 的元素后，数组变为 [0, 1, 3, 4]。
+       *   后续访问索引 3 时，实际指向原索引 4，可能跳过元素 3。
+       * ‌逆序遍历‌（从 4 开始）：
+       *   删除索引 4 后，数组变为 [0, 1, 2, 3]。
+       *   后续处理索引 3 时，指向新数组的最后一个元素 3，无遗漏。
+       */
+      var indexOffset = pendingTaskIds.size  // 初始值为数组长度
       while (indexOffset > 0) {
-        indexOffset -= 1
+        indexOffset -= 1           // 逆序访问索引
         val index = pendingTaskIds(indexOffset)
         if (copiesRunning(index) == 0 && !successful(index)) {
-          return true
+          return true  // 发现可调度任务，提前终止
         } else {
           pendingTaskIds.remove(indexOffset)
         }
@@ -615,18 +638,34 @@ private[spark] class TaskSetManager(
       hasTasks
     }
 
+    /**
+     * 下面这个while循环的逻辑：
+     * 1.‌优先尝试最高本地性‌，调度器首先尝试从最高本地性级别（如 PROCESS_LOCAL）的任务队列中分配任务。 若当前级别有可用任务‌：立即分配，无需等待。
+     * 2.若当前级别 ‌无可用任务‌，触发等待计时：
+     *   1） 记录起始时间戳‌：将 lastLocalityWaitResetTime 设置为当前时间（标记等待周期的开始）。
+     *   2） 进入等待状态‌：调度器不会立即降级，而是暂时挂起，等待新任务或资源释放。
+     * 3.超时判定与降级‌
+     *   1）每次资源到达时‌（如 Executor 空闲）：
+     *      检查 当前时间 - lastLocalityWaitResetTime 是否超过该级别的等待阈值（如 spark.locality.wait.process）。
+     *   2）若超时‌：
+     *      重置 lastLocalityWaitResetTime 为当前时间。
+     *      降级本地性级别‌（如从 PROCESS_LOCAL 降为 NODE_LOCAL）。
+     *   3）若未超时‌：继续等待该级别的任务。
+     * 4.循环直至任务分配‌
+     * 5.重复上述过程，直至任务被分配或所有本地性级别均尝试完毕。
+     */
     while (currentLocalityIndex < myLocalityLevels.length - 1) {
       val moreTasks = myLocalityLevels(currentLocalityIndex) match {
         case TaskLocality.PROCESS_LOCAL => moreTasksToRunIn(pendingTasks.forExecutor)
         case TaskLocality.NODE_LOCAL => moreTasksToRunIn(pendingTasks.forHost)
         case TaskLocality.NO_PREF => pendingTasks.noPrefs.nonEmpty
-        case TaskLocality.RACK_LOCAL => moreTasksToRunIn(pendingTasks.forRack)
+        case TaskLocality.RACK_LOCAL => moreTasksToRunIn(pendingTasks.forRack)  //若长期处于 RACK_LOCAL，可能数据分布不合理或本地性等待配置不当
       }
       if (!moreTasks) {
         // This is a performance optimization: if there are no more tasks that can
         // be scheduled at a particular locality level, there is no point in waiting
         // for the locality wait timeout (SPARK-4939).
-        lastLocalityWaitResetTime = curTime
+        lastLocalityWaitResetTime = curTime  //当前本地性级别没有可运行任务，那么更新时间为当前时间,准备重新计算
         logDebug(s"No tasks for locality level ${myLocalityLevels(currentLocalityIndex)}, " +
           s"so moving to locality level ${myLocalityLevels(currentLocalityIndex + 1)}")
         currentLocalityIndex += 1
@@ -636,6 +675,11 @@ private[spark] class TaskSetManager(
         lastLocalityWaitResetTime += localityWaits(currentLocalityIndex)
         logDebug(s"Moving to ${myLocalityLevels(currentLocalityIndex + 1)} after waiting for " +
           s"${localityWaits(currentLocalityIndex)}ms")
+
+        /**
+         * 1.若当前级别等待超时，则降级到下一级别, 例如:当 PROCESS_LOCAL 级别的任务因 Executor 繁忙无法调度时，本地性等待时间开始累积；若超时未调度，则降级到 NODE_LOCAL，而非任务本身进入排队等待资源
+         * 2.若一直等待高本地性资源，可能导致集群吞吐量下降。动态降级策略通过 localityWaits 阈值避免长时间等待
+         */
         currentLocalityIndex += 1
       } else {
         return myLocalityLevels(currentLocalityIndex)
@@ -1245,7 +1289,7 @@ private[spark] object TaskSetManager {
  */
 private[scheduler] class PendingTasksByLocality {
 
-  // Set of pending tasks for each executor.
+  // Set of pending tasks for each executor. （Executor名称，TaskSet中的任务下标集合）
   val forExecutor = new HashMap[String, ArrayBuffer[Int]]
   // Set of pending tasks for each host. Similar to pendingTasksForExecutor, but at host level.
   val forHost = new HashMap[String, ArrayBuffer[Int]]

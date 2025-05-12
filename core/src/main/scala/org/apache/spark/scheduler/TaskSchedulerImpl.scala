@@ -368,6 +368,7 @@ private[spark] class TaskSchedulerImpl(
    * @param tasks tasks scheduled per offer, value at index 'i' corresponds to shuffledOffers[i]
    * @return tuple of (no delay schedule rejects?, option of min locality of launched task)
    */
+//  将任务分配给具体的 Executor
   private def resourceOfferSingleTaskSet(
       taskSet: TaskSetManager,
       maxLocality: TaskLocality,
@@ -380,25 +381,30 @@ private[spark] class TaskSchedulerImpl(
     var minLaunchedLocality: Option[TaskLocality] = None
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
+//    1.遍历所有的Executor资源，直到
     for (i <- 0 until shuffledOffers.size) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
       val taskSetRpID = taskSet.taskSet.resourceProfileId
       // make the resource profile id a hard requirement for now - ie only put tasksets
       // on executors where resource profile exactly matches.
+
+      // 2. taskSet的ResourceId与Executor的ResourceId是一致的
       if (taskSetRpID == shuffledOffers(i).resourceProfileId) {
+        //3. 检查 Executor 的剩余资源是否满足启动单个任务的资源需求（CPU、GPU 数量等）,若不满足，跳过此executor
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, availableCpus(i),
           availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
           try {
             val prof = sc.resourceProfileManager.resourceProfileFromId(taskSetRpID)
             val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf)
+            //4. 尝试对executor分配指定任务本地性的任务，注意，此处优先高任务本地性，如果高优先级没有任务，那么等待一段时间（3s）后，进行任务本地性降级，重新查找可运行的任务，直到找到符合要求的任务
             val (taskDescOption, didReject, index) =
               taskSet.resourceOffer(execId, host, maxLocality, taskCpus, taskResAssignments)
             noDelayScheduleRejects &= !didReject
             for (task <- taskDescOption) {
               val (locality, resources) = if (task != null) {
-                tasks(i) += task
+                tasks(i) += task //将满足要求的task 收集到task容器中
                 addRunningTask(task.taskId, execId, taskSet)
                 (taskSet.taskInfos(task.taskId).taskLocality, task.resources)
               } else {
@@ -410,14 +416,14 @@ private[spark] class TaskSchedulerImpl(
               }
 
               minLaunchedLocality = minTaskLocality(minLaunchedLocality, Some(locality))
-              availableCpus(i) -= taskCpus
+              availableCpus(i) -= taskCpus  //对executor移除指定的cpu资源
               assert(availableCpus(i) >= 0)
               resources.foreach { case (rName, rInfo) =>
                 // Remove the first n elements from availableResources addresses, these removed
                 // addresses are the same as that we allocated in taskResourceAssignments since it's
                 // synchronized. We don't remove the exact addresses allocated because the current
                 // approach produces the identical result with less time complexity.
-                availableResources(i)(rName).remove(0, rInfo.addresses.size)
+                availableResources(i)(rName).remove(0, rInfo.addresses.size)  // // 减少其他资源（如 GPU 地址）
               }
             }
           } catch {
@@ -455,15 +461,16 @@ private[spark] class TaskSchedulerImpl(
       ): Option[Map[String, ResourceInformation]] = {
     val rpId = taskSet.taskSet.resourceProfileId
     val taskSetProf = sc.resourceProfileManager.resourceProfileFromId(rpId)
-    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
+    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf) //从配置中获取单个Task所需的CPU
     // check if the ResourceProfile has cpus first since that is common case
-    if (availCpus < taskCpus) return None
+    if (availCpus < taskCpus) return None //如果Executor可用 cpu 不足单个Task的，返回None，表示无可用资源
     // only look at the resource other then cpus
-    val tsResources = ResourceProfile.getCustomTaskResources(taskSetProf)
-    if (tsResources.isEmpty) return Some(Map.empty)
+    val tsResources = ResourceProfile.getCustomTaskResources(taskSetProf)  //获取除CPU之外的其他用户自定义资源
+    if (tsResources.isEmpty) return Some(Map.empty)   //若为空，表示CPU资源满足要求，返回空Map，此Executor可作为Task计算的节点
     val localTaskReqAssign = HashMap[String, ResourceInformation]()
     // we go through all resources here so that we can make sure they match and also get what the
     // assignments are for the next task
+    // 对用户定义的其他资源进行资源诉求判断
     for ((rName, taskReqs) <- tsResources) {
       val taskAmount = taskSetProf.getSchedulerTaskResourceAmount(rName)
       availWorkerResources.get(rName) match {
@@ -505,28 +512,37 @@ private[spark] class TaskSchedulerImpl(
     // Mark each worker as alive and remember its hostname
     // Also track if new executor is added
     var newExecAvail = false
+
+    /**
+     * 资源准备阶段
+     * ‌目的‌：更新集群拓扑结构，标记活跃Worker并注册新Executor,确保Executor与Host的映射关系正确
+     * 副作用：若有新Executor加入，后续任务集（TaskSet）需重新计算本地性（如任务可能优先调度到新节点）
+     */
     for (o <- offers) {
+      //若不包含，需注册新Executor
       if (!hostToExecutors.contains(o.host)) {
         hostToExecutors(o.host) = new HashSet[String]()
       }
       if (!executorIdToRunningTaskIds.contains(o.executorId)) {
         hostToExecutors(o.host) += o.executorId
-        executorAdded(o.executorId, o.host)
-        executorIdToHost(o.executorId) = o.host
-        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
-        newExecAvail = true
+        executorAdded(o.executorId, o.host)      // 触发Executor添加事件
+        executorIdToHost(o.executorId) = o.host  // 记录Executor与Host映射
+        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]() // 初始化运行任务集合
+        newExecAvail = true   // 标记有新Executor可用
       }
     }
     val hosts = offers.map(_.host).distinct
     for ((host, Some(rack)) <- hosts.zip(getRacksForHosts(hosts))) {
+      //构建机架（Rack）与Host的映射
       hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
     }
 
     // Before making any offers, include any nodes whose expireOnFailure timeout has expired. Do
     // this here to avoid a separate thread and added synchronization overhead, and also because
     // updating the excluded executors and nodes is only relevant when task offers are being made.
-    healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())
+    healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())  //先更新executor状态，移除超时的节点
 
+    // 健康检查排除故障节点
     val filteredOffers = healthTrackerOpt.map { healthTracker =>
       offers.filter { offer =>
         !healthTracker.isNodeExcluded(offer.host) &&
@@ -534,15 +550,18 @@ private[spark] class TaskSchedulerImpl(
       }
     }.getOrElse(offers)
 
+    // 资源洗牌避免热点
     val shuffledOffers = shuffleOffers(filteredOffers)
     // Build a list of tasks to assign to each worker.
     // Note the size estimate here might be off with different ResourceProfiles but should be
     // close estimate
-    val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK))
-    val availableResources = shuffledOffers.map(_.resources).toArray
+
+    // 初始化资源分配数据结构
+    val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK)) //每个Executor可分配的任务数，初始容量基于每个Worker的CPU核心数估算。
+    val availableResources = shuffledOffers.map(_.resources).toArray  //动态记录资源剩余量，分配任务时会实时更新（任务成功分配后立即扣减资源，确保并发安全）
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
-    val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    val sortedTaskSets = rootPool.getSortedTaskSetQueue  //根据调度策略（如FIFO/FAIR）排序任务集
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
         taskSet.parent.name, taskSet.name, taskSet.runningTasks))
@@ -557,6 +576,8 @@ private[spark] class TaskSchedulerImpl(
     for (taskSet <- sortedTaskSets) {
       // we only need to calculate available slots if using barrier scheduling, otherwise the
       // value is -1
+
+      // Barrier任务特殊处理:  Barrier任务特性‌：要求所有子任务同时启动，需预留足够并行资源，否则阻塞调度
       val numBarrierSlotsAvailable = if (taskSet.isBarrier) {
         val rpId = taskSet.taskSet.resourceProfileId
         val availableResourcesAmount = availableResources.map { resourceMap =>
@@ -580,18 +601,25 @@ private[spark] class TaskSchedulerImpl(
       } else {
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
-        var globalMinLocality: Option[TaskLocality] = None
+        var globalMinLocality: Option[TaskLocality] = None  //‌全局最小本地性跟踪:记录所有层级中实际分配的最低本地性级别，用于后续任务调度的降级决策
+
+        /**
+         * 按本地性级别迭代分配: 从taskSet的最高本地性开始遍历，直到获取到可以在Executor上可以运行的任务,  ‌本地性级别顺序‌：从高到低依次尝试（如优先调度到同一Executor）。
+         * 按本地性降序：PROCESS_LOCAL→NODE_LOCAL→RACK_LOCAL→ANY
+         * ‌循环分配‌：在当前级别下反复调用resourceOfferSingleTaskSet，直到无法分配更多任务。
+         */
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
+            // 在当前本地性级别下尽可能分配任务
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
               availableResources, tasks)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
-            noDelaySchedulingRejects &= noDelayScheduleReject
+            noDelaySchedulingRejects &= noDelayScheduleReject  //noDelaySchedulingRejects‌：若某个任务因延迟调度策略（等待更高本地性）被拒绝，标记为false。,策略触发‌：当所有资源分配未触发延迟拒绝时，允许立即降级到下一本地性级别
             globalMinLocality = minTaskLocality(globalMinLocality, minLocality)
-          } while (launchedTaskAtCurrentMaxLocality)
+          } while (launchedTaskAtCurrentMaxLocality)   // 直到无法分配更多任务
         }
 
         if (!legacyLocalityWaitReset) {
