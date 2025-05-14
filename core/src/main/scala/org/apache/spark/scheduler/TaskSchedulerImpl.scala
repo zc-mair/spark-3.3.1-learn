@@ -527,7 +527,7 @@ private[spark] class TaskSchedulerImpl(
         hostToExecutors(o.host) += o.executorId
         executorAdded(o.executorId, o.host)      // 触发Executor添加事件
         executorIdToHost(o.executorId) = o.host  // 记录Executor与Host映射
-        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]() // 初始化运行任务集合
+        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]() //初始化运行任务集合
         newExecAvail = true   // 标记有新Executor可用
       }
     }
@@ -622,19 +622,39 @@ private[spark] class TaskSchedulerImpl(
           } while (launchedTaskAtCurrentMaxLocality)   // 直到无法分配更多任务
         }
 
-        if (!legacyLocalityWaitReset) {
-          if (noDelaySchedulingRejects) {
+        /**
+         * 新旧调度策略切换：
+         * 1.旧版逻辑‌（legacyLocalityWaitReset=true）
+         *  1）本地性等待计时器的重置逻辑较为简单，可能在某些场景下过早触发计时器重置，导致本地性降级不够平滑。例如，在屏障任务（Barrier Task）未完全启动时，直接强制将计时器重置至最低本地性级别（如 NO_PREF），以加速剩余任务的调度48。
+         *
+         * 2.新版逻辑‌（legacyLocalityWaitReset=false）
+         *  1）引入了更精细化的延迟调度策略，仅在满足特定条件时（如成功启动任务且无延迟调度拒绝）才重置计时器。这有助于优化本地性保持，减少不必要的降级，提升任务调度效
+         *
+         * 本地性降级控制：
+         * 1.延迟调度拒绝（Delay Scheduling Rejects）
+         *  1)当任务因等待更高本地性资源而被拒绝调度时，若 legacyLocalityWaitReset=false，系统会根据拒绝次数动态调整本地性降级逻辑，避免频繁重置计时器；而旧版逻辑可能忽略此类动态调整
+         * 2.‌屏障任务兼容性‌：针对需要同步启动的屏障任务，旧版逻辑会在部分任务启动后直接触发计时器重置，确保剩余任务快速调度；新版逻辑则仅在任务完全无法调度时才干预计时器
+         *
+         * 引入legacyLocalityWaitReset的意义：
+         * 1.兼容性保障‌： 允许用户或开发者回退到旧版本地性调度逻辑，以适配某些特定场景或历史遗留问题
+         * 2.性能优化‌：新版逻辑通过减少非必要的计时器重置，提升了任务调度的本地性敏感度和整体吞吐量
+         *
+         *
+         */
+        if (!legacyLocalityWaitReset) { // 启用新计时器管理策略
+          if (noDelaySchedulingRejects) { //当前调度周期内是否所有任务分配均未因延迟调度策略被拒绝。
+
             if (launchedAnyTask &&
               (isAllFreeResources || noRejectsSinceLastReset.getOrElse(taskSet.taskSet, true))) {
-              taskSet.resetDelayScheduleTimer(globalMinLocality)
-              noRejectsSinceLastReset.update(taskSet.taskSet, true)
+              taskSet.resetDelayScheduleTimer(globalMinLocality)  // 重置本地性等待计时器
+              noRejectsSinceLastReset.update(taskSet.taskSet, true) //标记该任务集无调度拒绝
             }
-          } else {
-            noRejectsSinceLastReset.update(taskSet.taskSet, false)
+          } else {// 存在延迟调度拒绝
+            noRejectsSinceLastReset.update(taskSet.taskSet, false) // 标记任务集存在拒绝
           }
         }
 
-        if (!launchedAnyTask) {
+        if (!launchedAnyTask) { // 未成功启动任何任务
           taskSet.getCompletelyExcludedTaskIfAny(hostToExecutors).foreach { taskIndex =>
               // If the taskSet is unschedulable we try to find an existing idle excluded
               // executor and kill the idle executor and kick off an abortTimer which if it doesn't
@@ -651,34 +671,37 @@ private[spark] class TaskSchedulerImpl(
               // If there are no idle executors and dynamic allocation is enabled, then we would
               // notify ExecutorAllocationManager to allocate more executors to schedule the
               // unschedulable tasks else we will abort immediately.
+
+
+              // 检查是否存在空闲但是被加入黑名单的Executor
               executorIdToRunningTaskIds.find(x => !isExecutorBusy(x._1)) match {
                 case Some ((executorId, _)) =>
-                  if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {
-                    healthTrackerOpt.foreach(blt => blt.killExcludedIdleExecutor(executorId))
-                    updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex)
+                  if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) { // 用于判断当前任务集是否未被标记为已进入‌无法调度超时处理流程‌
+                    healthTrackerOpt.foreach(blt => blt.killExcludedIdleExecutor(executorId)) // 强制杀死空闲被排除的Executor以释放资源
+                    updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex)// 启动中止计时器，若超时仍未调度则中止任务集
                   }
-                case None =>
+                case None => //无空闲被排除的Executor
                   //  Notify ExecutorAllocationManager about the unschedulable task set,
                   // in order to provision more executors to make them schedulable
-                  if (Utils.isDynamicAllocationEnabled(conf)) {
-                    if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {
+                  if (Utils.isDynamicAllocationEnabled(conf)) { // 动态分配开启
+                    if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {  // 用于判断当前任务集是否未被标记为已进入‌无法调度超时处理流程‌
                       logInfo("Notifying ExecutorAllocationManager to allocate more executors to" +
                         " schedule the unschedulable task before aborting" +
                         " stage ${taskSet.stageId}.")
                       dagScheduler.unschedulableTaskSetAdded(taskSet.taskSet.stageId,
-                        taskSet.taskSet.stageAttemptId)
-                      updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex)
+                        taskSet.taskSet.stageAttemptId)  // 通知申请新Executor
+                      updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex) // 启动中止计时器
                     }
-                  } else {
+                  } else {  // 动态分配关闭
                     // Abort Immediately
                     logInfo("Cannot schedule any task because all executors excluded from " +
                       "failures. No idle executors can be found to kill. Aborting stage " +
                       s"${taskSet.stageId}.")
-                    taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex)
+                    taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex) // 立即中止任务集
                   }
               }
           }
-        } else {
+        } else { //launchedAnyTask为true，表示成功启动至少一个任务
           // We want to defer killing any taskSets as long as we have a non excluded executor
           // which can be used to schedule a task from any active taskSets. This ensures that the
           // job can make progress.
@@ -691,8 +714,8 @@ private[spark] class TaskSchedulerImpl(
             // Notify ExecutorAllocationManager as well as other subscribers that a task now
             // recently becomes schedulable
             dagScheduler.unschedulableTaskSetRemoved(taskSet.taskSet.stageId,
-              taskSet.taskSet.stageAttemptId)
-            unschedulableTaskSetToExpiryTime.clear()
+              taskSet.taskSet.stageAttemptId)  //通知任务集恢复可调度
+            unschedulableTaskSetToExpiryTime.clear() // 清除中止计时器
           }
         }
 

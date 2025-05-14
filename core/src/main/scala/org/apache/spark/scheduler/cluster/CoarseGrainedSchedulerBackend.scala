@@ -366,7 +366,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
         }
       }
       if (taskDescs.nonEmpty) {
-        launchTasks(taskDescs)
+        launchTasks(taskDescs) //提交任务到Executor节点，通过executorEndpoint发送launchTask消息
       }
     }
 
