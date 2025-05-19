@@ -938,9 +938,12 @@ private[spark] class DAGScheduler(
       callSite: CallSite,
       resultHandler: (Int, U) => Unit,
       properties: Properties): Unit = {
-    val start = System.nanoTime
+    val start = System.nanoTime //记录任务提交起始时间戳（纳秒级精度）
+    //通过submitJob方法向DAGScheduler提交任务，返回JobWaiter对象用于跟踪任务状态
     val waiter = submitJob(rdd, func, partitions, callSite, resultHandler, properties)
+    //阻塞当前线程直到任务完成（Duration.Inf表示无限等待）
     ThreadUtils.awaitReady(waiter.completionFuture, Duration.Inf)
+    //结果处理
     waiter.completionFuture.value.get match {
       case scala.util.Success(_) =>
         logInfo("Job %d finished: %s, took %f s".format

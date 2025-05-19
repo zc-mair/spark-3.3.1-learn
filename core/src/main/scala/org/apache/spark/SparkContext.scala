@@ -2219,15 +2219,16 @@ class SparkContext(config: SparkConf) extends Logging {
     if (stopped.get()) {
       throw new IllegalStateException("SparkContext has been shutdown")
     }
-    val callSite = getCallSite
-    val cleanedFunc = clean(func)
-    logInfo("Starting job: " + callSite.shortForm)
+    val callSite = getCallSite  //获取代码调用位置（用于日志和调试）
+    val cleanedFunc = clean(func) //闭包清理，清理函数闭包中的不可序列化引用
+    logInfo("Starting job: " + callSite.shortForm) //记录作业启动信息（含简化的调用位置）
     if (conf.getBoolean("spark.logLineage", false)) {
       logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
     }
+    //‌提交DAG调度:核心操作：将任务提交给DAG调度器执行,resultHandler以异步方式接收每个分区的计算结果
     dagScheduler.runJob(rdd, cleanedFunc, partitions, callSite, resultHandler, localProperties.get)
-    progressBar.foreach(_.finishAll())
-    rdd.doCheckpoint()
+    progressBar.foreach(_.finishAll()) //如果存在进度条则标记完成
+    rdd.doCheckpoint() //触发RDD的检查点操作（若已设置检查点路径）
   }
 
   /**
@@ -2305,6 +2306,14 @@ class SparkContext(config: SparkConf) extends Logging {
     rdd: RDD[T],
     processPartition: (TaskContext, Iterator[T]) => U,
     resultHandler: (Int, U) => Unit): Unit = {
+    /**
+     * T：RDD存储的数据类型 U:rdd经func计算后返回的数据结果
+     * rdd：action 对应的RDD
+     * processPartition， 对action rdd计算出的数据，进行逐行处理的函数
+     * 0 until rdd.partitions.length：表示待计算的分区，用户可指定仅计算部分分区，例如 rdd.take(3)
+     * resultHandler: 处理每个分区结果的回调函数，Int->行下标，U:表示返回的数据类型
+     *
+     */
     runJob[T, U](rdd, processPartition, 0 until rdd.partitions.length, resultHandler)
   }
 
