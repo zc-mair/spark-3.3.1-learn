@@ -597,13 +597,48 @@ private[spark] class DAGScheduler(
       partitions: Array[Int],
       jobId: Int,
       callSite: CallSite): ResultStage = {
+
+    /**
+     *  获取RDD的Shuffle依赖（仅获取一级，不进行递归获取所有的shuffle依赖）、
+     *  以及RDD当前Stage链路上所有的资源配置文件（例如：resourceProfiles.id ->要求 rdd调度到此 资源编号的 Executor上， 运行task所需的cpu、Memory需求,用户自定义的例如GPU需求等）
+     *
+     *  注意：这个资源配置不是所有的RDD资源配置集合， 例如 A->B->C->D  ,其中B为ShuffleRDD，那么 从D开始获取，仅获取C->D 这两个RDD的资源配置，B之前的属于另一个Stage了，不用关心，只关心当前Stage的
+     */
+
     val (shuffleDeps, resourceProfiles) = getShuffleDependenciesAndResourceProfiles(rdd)
+
+    /**
+     *  合并多个RDD的资源需求配置, 每个资源需求，取最大的，例如 一个CPU要求2，一个CPU要求3，那么合并后就为3，
+     *
+     *  如果没有设置资源配置，就取default资源配置文件(spark-deaults.conf里面配置的)
+     *  用户在使用RDD开发的时候，可以设置资源配置，
+     *
+     *  在 Spark 3.0（2020 年发布）中，ResourceProfile 及相关管理组件首次被集成，支持用户自定义 Executor 和 Task 的资源规格（如 GPU、FPGA、内存等），突破传统仅基于 CPU 和内存调度的限制
+     *
+     * val rp = new ResourceProfileBuilder()
+     * .require(ResourceProfile.GPU, 2)  // 每个 Executor 需 2 GPU
+     * .build()
+     *
+     * rdd1.union(rdd2).withResource(rp).join(rdd3).withResource(rp2).collect, 两个阶段指定了不同高度ResourceProfile需求
+     */
+
     val resourceProfile = mergeResourceProfilesForStage(resourceProfiles)
-    checkBarrierStageWithDynamicAllocation(rdd)
-    checkBarrierStageWithNumSlots(rdd, resourceProfile)
-    checkBarrierStageWithRDDChainPattern(rdd, partitions.toSet.size)
+
+    //Barrier模式校验‌（Spark 3.0+特性）
+    checkBarrierStageWithDynamicAllocation(rdd)  //动态分配兼容性校验，当为Barrier模式时，动态资源分配开关需要打开
+    checkBarrierStageWithNumSlots(rdd, resourceProfile)  //resourceProfile定义的Executor槽位数是否足够（rdd parition数目< 可用的槽位数）
+    checkBarrierStageWithRDDChainPattern(rdd, partitions.toSet.size) //RDD链模式是否符合要求
+
+
+    //递归创建/获取所有Shuffle依赖对应的父Stage
     val parents = getOrCreateParentStages(shuffleDeps, jobId)
+
+    /**
+     * 生成最终阶段的StageID, 注意： 这个ID是最大的，父StageID是小于它的，根据目前Stage回溯，可以知道 A->B->C->D->E->F  ,例如 F.collect() 触发 A-B 划分为Stage0, C->D 划分为Stage1 E->F划分为ResultStage2
+     */
     val id = nextStageId.getAndIncrement()
+
+    //最终阶段的Stage，包含
     val stage = new ResultStage(id, rdd, func, partitions, parents, jobId,
       callSite, resourceProfile.id)
     stageIdToStage(id) = stage
@@ -659,24 +694,26 @@ private[spark] class DAGScheduler(
    * calling this function with rdd C will only return the B <-- C dependency.
    *
    * This function is scheduler-visible for the purpose of unit testing.
+   *
+   * 获取给定RDD的直接Shuffle依赖父级和关联的ResourceProfile集合，用于构建Stage依赖关系和资源分配
    */
   private[scheduler] def getShuffleDependenciesAndResourceProfiles(
       rdd: RDD[_]): (HashSet[ShuffleDependency[_, _, _]], HashSet[ResourceProfile]) = {
     val parents = new HashSet[ShuffleDependency[_, _, _]]
     val resourceProfiles = new HashSet[ResourceProfile]
-    val visited = new HashSet[RDD[_]]
-    val waitingForVisit = new ListBuffer[RDD[_]]
+    val visited = new HashSet[RDD[_]] //记录已访问的RDD（避免重复处理）
+    val waitingForVisit = new ListBuffer[RDD[_]] //待访问的RDD队列（ListBuffer实现）
     waitingForVisit += rdd
     while (waitingForVisit.nonEmpty) {
       val toVisit = waitingForVisit.remove(0)
       if (!visited(toVisit)) {
         visited += toVisit
-        Option(toVisit.getResourceProfile).foreach(resourceProfiles += _)
+        Option(toVisit.getResourceProfile).foreach(resourceProfiles += _)  //当前RDD如果设置了资源配置，就存储
         toVisit.dependencies.foreach {
           case shuffleDep: ShuffleDependency[_, _, _] =>
-            parents += shuffleDep
+            parents += shuffleDep    //仅获取父shuffle，不再向上追溯
           case dependency =>
-            waitingForVisit.prepend(dependency.rdd)
+            waitingForVisit.prepend(dependency.rdd) //对于非ShuffleDependency，需要继续遍历RDD，获取上一个Shuffle到当前RDD之间所有的RDD的资源配置信息
         }
       }
     }
@@ -880,6 +917,7 @@ private[spark] class DAGScheduler(
       callSite: CallSite,
       resultHandler: (Int, U) => Unit,
       properties: Properties): JobWaiter[U] = {
+    //分区合法性校验，不能超过RDD最大分区，也不能小于0
     // Check to make sure we are not launching a task on a partition that does not exist.
     val maxPartitions = rdd.partitions.length
     partitions.find(p => p >= maxPartitions || p < 0).foreach { p =>
@@ -891,26 +929,43 @@ private[spark] class DAGScheduler(
     // SPARK-23626: `RDD.getPartitions()` can be slow, so we eagerly compute
     // `.partitions` on every RDD in the DAG to ensure that `getPartitions()`
     // is evaluated outside of the DAGScheduler's single-threaded event loop:
-    eagerlyComputePartitionsForRddAndAncestors(rdd)
+    eagerlyComputePartitionsForRddAndAncestors(rdd)  //‌分区预计算优化，在DAG调度器的单线程事件循环外提前计算RDD及其祖先的分区信息，避免在事件循环中执行耗时的getPartitions()操作
 
-    val jobId = nextJobId.getAndIncrement()
+    val jobId = nextJobId.getAndIncrement() //生成JobID, RDD的每一个action操作都会生成一个Job
+    //若给定的分区为空
     if (partitions.isEmpty) {
       val clonedProperties = Utils.cloneProperties(properties)
+      // 设置默认任务描述（调用位置信息）
       if (sc.getLocalProperty(SparkContext.SPARK_JOB_DESCRIPTION) == null) {
         clonedProperties.setProperty(SparkContext.SPARK_JOB_DESCRIPTION, callSite.shortForm)
       }
       val time = clock.getTimeMillis()
+      // 发送开始/结束事件（零任务场景）
       listenerBus.post(
         SparkListenerJobStart(jobId, time, Seq.empty, clonedProperties))
       listenerBus.post(
         SparkListenerJobEnd(jobId, time, JobSucceeded))
       // Return immediately if the job is running 0 tasks
-      return new JobWaiter[U](this, jobId, 0, resultHandler)
+      return new JobWaiter[U](this, jobId, 0, resultHandler)  //返回JobWaiter，由于totalTask=0，故表示任务已完成
     }
 
     assert(partitions.nonEmpty)
-    val func2 = func.asInstanceOf[(TaskContext, Iterator[_]) => _]
-    val waiter = new JobWaiter[U](this, jobId, partitions.size, resultHandler)
+    val func2 = func.asInstanceOf[(TaskContext, Iterator[_]) => _] //类型擦除处理：将函数转换为通用类型（兼容Java API）
+    val waiter = new JobWaiter[U](this, jobId, partitions.size, resultHandler) //创建JobWaiter用于跟踪任务完成状态
+
+
+    /**
+     * 通过事件循环异步提交JobSubmitted事件（包含深度克隆的properties）
+     *
+     * 提交任务的调用链:
+     * SparkContext.runJob → DAGScheduler.submitJob → EventLoop.post → DAGSchedulerEventProcessLoop.onReceive  → DAGScheduler.submitStage  → DAGScheduler.submitMissingTasks →
+     *  taskScheduler.submitTasks → taskScheduler.createTaskSetManager  → taskScheduler.schedulableBuilder.addTaskSetManager  → taskScheduler.CoarseGrainedSchedulerBackend.reviveOffers(driverEndpoint.send(ReviveOffers))->
+     *
+     *  CoarseGrainedSchedulerBackend.onReceive(ReviveOffers)   →  CoarseGrainedSchedulerBackend.executorDataMap createWorkOffers   →
+     *  CoarseGrainedSchedulerBackend.scheduler.resourceOffers(workOffers, true)  → CoarseGrainedSchedulerBackend.launchTasks   → CoarseGrainedSchedulerBackend.executorDataMap.executorEndpoint.send(LaunchTask)
+     *
+     *
+     */
     eventProcessLoop.post(JobSubmitted(
       jobId, rdd, func2, partitions.toArray, callSite, waiter,
       Utils.cloneProperties(properties)))
@@ -1218,9 +1273,9 @@ private[spark] class DAGScheduler(
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
-      finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
+      finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite) //创建最终的Stage阶段，可能抛出两种异常
     } catch {
-      case e: BarrierJobSlotsNumberCheckFailed =>
+      case e: BarrierJobSlotsNumberCheckFailed =>  //Barrier阶段资源不足
         // If jobId doesn't exist in the map, Scala coverts its value null to 0: Int automatically.
         val numCheckFailures = barrierJobIdToNumTasksCheckFailures.compute(jobId,
           (_: Int, value: Int) => value + 1)
@@ -1228,12 +1283,12 @@ private[spark] class DAGScheduler(
         logWarning(s"Barrier stage in job $jobId requires ${e.requiredConcurrentTasks} slots, " +
           s"but only ${e.maxConcurrentTasks} are available. " +
           s"Will retry up to ${maxFailureNumTasksCheck - numCheckFailures + 1} more times")
-
+         //Barrier模式重试机制
         if (numCheckFailures <= maxFailureNumTasksCheck) {
           messageScheduler.schedule(
             new Runnable {
               override def run(): Unit = eventProcessLoop.post(JobSubmitted(jobId, finalRDD, func,
-                partitions, callSite, listener, properties))
+                partitions, callSite, listener, properties))  // 延迟重试
             },
             timeIntervalNumTasksCheck,
             TimeUnit.SECONDS
@@ -1242,20 +1297,20 @@ private[spark] class DAGScheduler(
         } else {
           // Job failed, clear internal data.
           barrierJobIdToNumTasksCheckFailures.remove(jobId)
-          listener.jobFailed(e)
+          listener.jobFailed(e)  //最终失败
           return
         }
 
-      case e: Exception =>
+      case e: Exception =>  //其他异常，例如HDFS文件丢失等
         logWarning("Creating new stage failed due to exception - job: " + jobId, e)
         listener.jobFailed(e)
         return
     }
     // Job submitted, clear internal data.
-    barrierJobIdToNumTasksCheckFailures.remove(jobId)
+    barrierJobIdToNumTasksCheckFailures.remove(jobId)  //清理Barrier失败的Job记录
 
-    val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)
-    clearCacheLocs()
+    val job = new ActiveJob(jobId, finalStage, callSite, listener, properties)  //创建ActiveJob并注册到调度器
+    clearCacheLocs() //清理缓存位置信息
     logInfo("Got job %s (%s) with %d output partitions".format(
       job.jobId, callSite.shortForm, partitions.length))
     logInfo("Final stage: " + finalStage + " (" + finalStage.name + ")")
@@ -1267,11 +1322,13 @@ private[spark] class DAGScheduler(
     activeJobs += job
     finalStage.setActiveJob(job)
     val stageIds = jobIdToStageIds(jobId).toArray
-    val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
+    val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))  //关联的stageInfos信息提取，此信息可用于SparkUI 各个RDD的图形关系绘制
+
+    //通过监听器总线发送 Job 启动事件，包含JobID、提交的时间戳、关联的Stage信息、克隆的任务属性
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos,
         Utils.cloneProperties(properties)))
-    submitStage(finalStage)
+    submitStage(finalStage) //阶段提交
   }
 
   private[scheduler] def handleMapStageSubmitted(jobId: Int,
