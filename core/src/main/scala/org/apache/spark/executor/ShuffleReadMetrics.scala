@@ -27,15 +27,38 @@ import org.apache.spark.util.LongAccumulator
  * A collection of accumulators that represent metrics about reading shuffle data.
  * Operations are not thread-safe.
  */
+
+/**
+ * 1.线程安全说明‌
+ *   明确标注"Operations are not thread-safe"：
+ *       1)每个task线程持有独立的ShuffleReadMetrics实例
+ *       2)依赖上层调用方保证线程隔离
+ *       3) 最终通过mergeShuffleReadMetrics安全合并
+ * 2.Shuffle优化关键指标‌
+ * ‌网络瓶颈检测‌：高_remoteBlocksFetched+长_fetchWaitTime需调大spark.reducer.maxSizeInFlight
+ * ‌数据倾斜定位‌：_remoteBytesRead差异过大表明分区不均
+ * ‌内存压力识别‌：_remoteBytesReadToDisk > 0时需要增加spark.shuffle.memoryFraction
+ *
+ * 3.典型使用场景：
+ *  Reduce阶段开始时：
+      1. 创建ShuffleReadMetrics实例
+      2. 每个分区读取线程更新对应指标
+      3. 最终合并到TaskMetrics
+    调优示例：
+      当_remoteBytesReadToDisk持续增长时：
+        - 增加spark.shuffle.spill.batchSize
+        - 检查spark.shuffle.file.buffer配置
+ *
+ */
 @DeveloperApi
 class ShuffleReadMetrics private[spark] () extends Serializable {
-  private[executor] val _remoteBlocksFetched = new LongAccumulator
-  private[executor] val _localBlocksFetched = new LongAccumulator
-  private[executor] val _remoteBytesRead = new LongAccumulator
-  private[executor] val _remoteBytesReadToDisk = new LongAccumulator
-  private[executor] val _localBytesRead = new LongAccumulator
-  private[executor] val _fetchWaitTime = new LongAccumulator
-  private[executor] val _recordsRead = new LongAccumulator
+  private[executor] val _remoteBlocksFetched = new LongAccumulator    // 从其他节点获取的块数（网络IO）
+  private[executor] val _localBlocksFetched = new LongAccumulator    // 本地直接读取的块数（零拷贝优化）
+  private[executor] val _remoteBytesRead = new LongAccumulator       // 通过网络读取的字节总数
+  private[executor] val _remoteBytesReadToDisk = new LongAccumulator // 溢出到磁盘的远程数据量（内存不足时）
+  private[executor] val _localBytesRead = new LongAccumulator  // 本地读取的字节量
+  private[executor] val _fetchWaitTime = new LongAccumulator  // 等待块传输的总时间（毫秒）
+  private[executor] val _recordsRead = new LongAccumulator    // 处理后输出的记录条数
 
   /**
    * Number of remote blocks fetched in this shuffle by this task.

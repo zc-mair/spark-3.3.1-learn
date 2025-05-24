@@ -51,43 +51,50 @@ import org.apache.spark.rdd.RDD
  * @param isBarrier whether this task belongs to a barrier stage. Spark must launch all the tasks
  *                  at the same time for a barrier stage.
  */
+
+//‌泛型参数‌：T表示输入数据类型，U表示输出类型（如saveAsTextFile时U=Unit）
 private[spark] class ResultTask[T, U](
     stageId: Int,
     stageAttemptId: Int,
-    taskBinary: Broadcast[Array[Byte]],
+    taskBinary: Broadcast[Array[Byte]],  //通过广播变量获取，来避免重复序列化
     partition: Partition,
     locs: Seq[TaskLocation],
-    val outputId: Int,
+    val outputId: Int,     //标识任务输出位置 | （对应RDD分区ID）
     localProperties: Properties,
-    serializedTaskMetrics: Array[Byte],
+    serializedTaskMetrics: Array[Byte],  //序列化的性能指标
     jobId: Option[Int] = None,
     appId: Option[String] = None,
     appAttemptId: Option[String] = None,
-    isBarrier: Boolean = false)
+    isBarrier: Boolean = false)  //‌屏障阶段支持‌：通过isBarrier参数实现同步点控制（用于MLlib等场景）
   extends Task[U](stageId, stageAttemptId, partition.index, localProperties, serializedTaskMetrics,
     jobId, appId, appAttemptId, isBarrier)
   with Serializable {
 
   @transient private[this] val preferredLocs: Seq[TaskLocation] = {
-    if (locs == null) Nil else locs.distinct
+    if (locs == null) Nil else locs.distinct  //数据本地性，基于BlockManager数据位置信息
   }
 
   override def runTask(context: TaskContext): U = {
     // Deserialize the RDD and the func using the broadcast variables.
     val threadMXBean = ManagementFactory.getThreadMXBean
+
+    /**
+     * 精确性能监控
+     */
+    // 纳秒级时间测量
     val deserializeStartTimeNs = System.nanoTime()
     val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
-      threadMXBean.getCurrentThreadCpuTime
+      threadMXBean.getCurrentThreadCpuTime // 线程级CPU时间统计（需JMX支持）
     } else 0L
     val ser = SparkEnv.get.closureSerializer.newInstance()
     val (rdd, func) = ser.deserialize[(RDD[T], (TaskContext, Iterator[T]) => U)](
       ByteBuffer.wrap(taskBinary.value), Thread.currentThread.getContextClassLoader)
-    _executorDeserializeTimeNs = System.nanoTime() - deserializeStartTimeNs
+    _executorDeserializeTimeNs = System.nanoTime() - deserializeStartTimeNs  //反序列化耗时统计
     _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
-      threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
+      threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime   //反序列化CPU耗时统计
     } else 0L
 
-    func(context, rdd.iterator(partition, context))
+    func(context, rdd.iterator(partition, context))  //
   }
 
   // This is only callable on the driver side.

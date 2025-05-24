@@ -42,20 +42,37 @@ import org.apache.spark.util._
  * and when the task failed with an exception. The [[TaskMetrics]] object itself should never
  * be sent to the driver.
  */
+//TaskMetrics用于精确采集和传输任务执行过程中的性能指标
 @DeveloperApi
-class TaskMetrics private[spark] () extends Serializable {
+class TaskMetrics private[spark]() extends Serializable {
   // Each metric is internally represented as an accumulator
-  private val _executorDeserializeTime = new LongAccumulator
-  private val _executorDeserializeCpuTime = new LongAccumulator
-  private val _executorRunTime = new LongAccumulator
-  private val _executorCpuTime = new LongAccumulator
-  private val _resultSize = new LongAccumulator
-  private val _jvmGCTime = new LongAccumulator
-  private val _resultSerializationTime = new LongAccumulator
-  private val _memoryBytesSpilled = new LongAccumulator
-  private val _diskBytesSpilled = new LongAccumulator
-  private val _peakExecutionMemory = new LongAccumulator
-  private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)]
+  /**
+   * ‌时间监控类变量
+   */
+  private val _executorDeserializeTime = new LongAccumulator //任务反序列化耗时（毫秒级）
+  private val _executorDeserializeCpuTime = new LongAccumulator // 反序列化CPU时间（纳秒级）
+  private val _executorRunTime = new LongAccumulator // 任务执行总时间（含shuffle读取）
+  private val _executorCpuTime = new LongAccumulator // 纯CPU计算时间（排除I/O等待）
+
+  /**
+   * 资源消耗类变量
+   */
+  private val _jvmGCTime = new LongAccumulator // GC停顿时间（用于内存调优）
+
+  private val _memoryBytesSpilled = new LongAccumulator //内存溢出到磁盘的数据量
+  private val _diskBytesSpilled = new LongAccumulator //直接写入磁盘的数据量
+  private val _peakExecutionMemory = new LongAccumulator //内存使用峰值（单位字节）
+
+  /**
+   * 任务结果类变量
+   */
+  private val _resultSize = new LongAccumulator // 任务返回结果序列化后大小
+  private val _resultSerializationTime = new LongAccumulator //任务结果序列化耗时
+
+  /**
+   * 特殊状态变量
+   */
+  private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)] // 记录任务修改的块状态（用于故障恢复）
 
   /**
    * Time taken on the executor to deserialize this task.
@@ -129,22 +146,35 @@ class TaskMetrics private[spark] () extends Serializable {
   // Setters and increment-ers
   private[spark] def setExecutorDeserializeTime(v: Long): Unit =
     _executorDeserializeTime.setValue(v)
+
   private[spark] def setExecutorDeserializeCpuTime(v: Long): Unit =
     _executorDeserializeCpuTime.setValue(v)
+
   private[spark] def setExecutorRunTime(v: Long): Unit = _executorRunTime.setValue(v)
+
   private[spark] def setExecutorCpuTime(v: Long): Unit = _executorCpuTime.setValue(v)
+
   private[spark] def setResultSize(v: Long): Unit = _resultSize.setValue(v)
+
   private[spark] def setJvmGCTime(v: Long): Unit = _jvmGCTime.setValue(v)
+
   private[spark] def setResultSerializationTime(v: Long): Unit =
     _resultSerializationTime.setValue(v)
+
   private[spark] def setPeakExecutionMemory(v: Long): Unit = _peakExecutionMemory.setValue(v)
+
   private[spark] def incMemoryBytesSpilled(v: Long): Unit = _memoryBytesSpilled.add(v)
+
   private[spark] def incDiskBytesSpilled(v: Long): Unit = _diskBytesSpilled.add(v)
+
   private[spark] def incPeakExecutionMemory(v: Long): Unit = _peakExecutionMemory.add(v)
+
   private[spark] def incUpdatedBlockStatuses(v: (BlockId, BlockStatus)): Unit =
     _updatedBlockStatuses.add(v)
+
   private[spark] def setUpdatedBlockStatuses(v: java.util.List[(BlockId, BlockStatus)]): Unit =
     _updatedBlockStatuses.setValue(v)
+
   private[spark] def setUpdatedBlockStatuses(v: Seq[(BlockId, BlockStatus)]): Unit =
     _updatedBlockStatuses.setValue(v.asJava)
 
@@ -152,24 +182,24 @@ class TaskMetrics private[spark] () extends Serializable {
    * Metrics related to reading data from a [[org.apache.spark.rdd.HadoopRDD]] or from persisted
    * data, defined only in tasks with input.
    */
-  val inputMetrics: InputMetrics = new InputMetrics()
+  val inputMetrics: InputMetrics = new InputMetrics() // 跟踪HDFS/Hive等数据源的读取情况,包含：字节数、记录数、耗时，注意：在Kafka源中还会跟踪偏移量
 
   /**
    * Metrics related to writing data externally (e.g. to a distributed filesystem),
    * defined only in tasks with output.
    */
-  val outputMetrics: OutputMetrics = new OutputMetrics()
+  val outputMetrics: OutputMetrics = new OutputMetrics() // 记录写入外部存储(如HDFS/S3)的指标
 
   /**
    * Metrics related to shuffle read aggregated across all shuffle dependencies.
    * This is defined only if there are shuffle dependencies in this task.
    */
-  val shuffleReadMetrics: ShuffleReadMetrics = new ShuffleReadMetrics()
+  val shuffleReadMetrics: ShuffleReadMetrics = new ShuffleReadMetrics() // 聚合所有shuffle依赖的读取指标，Read：远程块数、本地块数、获取数据大小
 
   /**
    * Metrics related to shuffle write, defined only in shuffle map stages.
    */
-  val shuffleWriteMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics()
+  val shuffleWriteMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics() // 仅shuffle map阶段存在，写入记录数、字节数、溢出文件数
 
   /**
    * A list of [[TempShuffleReadMetrics]], one per shuffle dependency.
@@ -177,6 +207,21 @@ class TaskMetrics private[spark] () extends Serializable {
    * A task may have multiple shuffle readers for multiple dependencies. To avoid synchronization
    * issues from readers in different threads, in-progress tasks use a [[TempShuffleReadMetrics]]
    * for each dependency and merge these metrics before reporting them to the driver.
+   */
+
+  /**
+   * 临时指标优化设计,用于解决多依赖并发问题：每个shuffle依赖独立记录，任务结束时合并到shuffleReadMetrics，
+   * 注意：当tempShuffleReadMetrics持续增长时需检查数据倾斜
+   *
+   * 运行示例：
+   *  Map阶段:
+   *   inputMetrics记录输入
+   *   shuffleWriteMetrics记录输出
+   *
+   *  Reduce阶段:
+   *   shuffleReadMetrics聚合多个map输出
+   *   outputMetrics记录最终输出
+   *
    */
   @transient private lazy val tempShuffleReadMetrics = new ArrayBuffer[TempShuffleReadMetrics]
 
@@ -197,6 +242,15 @@ class TaskMetrics private[spark] () extends Serializable {
    * Merge values across all temporary [[ShuffleReadMetrics]] into `_shuffleReadMetrics`.
    * This is expected to be called on executor heartbeat and at the end of a task.
    */
+
+  /**
+   * ‌指标合并机制, 触发时机： Executor心跳周期（默认3秒）、 任务结束时刻
+   *
+   * 合并策略：
+   *  1）将多个临时指标聚合成全局shuffleReadMetrics
+   *  2）避免driver端合并竞争
+   *
+   */
   private[spark] def mergeShuffleReadMetrics(): Unit = synchronized {
     if (tempShuffleReadMetrics.nonEmpty) {
       shuffleReadMetrics.setMergeValues(tempShuffleReadMetrics.toSeq)
@@ -204,10 +258,11 @@ class TaskMetrics private[spark] () extends Serializable {
   }
 
   // Only used for test
-  private[spark] val testAccum = sys.props.get(IS_TESTING.key).map(_ => new LongAccumulator)
+  private[spark] val testAccum = sys.props.get(IS_TESTING.key).map(_ => new LongAccumulator)  //‌测试专用累加器
 
 
   import InternalAccumulator._
+
   @transient private[spark] lazy val nameToAccums = LinkedHashMap(
     EXECUTOR_DESERIALIZE_TIME -> _executorDeserializeTime,
     EXECUTOR_DESERIALIZE_CPU_TIME -> _executorDeserializeCpuTime,
@@ -245,7 +300,8 @@ class TaskMetrics private[spark] () extends Serializable {
 
   private[spark] def register(sc: SparkContext): Unit = {
     nameToAccums.foreach {
-      case (name, acc) => acc.register(sc, name = Some(name), countFailedValues = true)
+      //为每个累加器调用register方法，将其注册到SparkContext中
+      case (name, acc) => acc.register(sc, name = Some(name), countFailedValues = true)  //countFailedValues=true表示统计失败任务的值（如推测执行场景）
     }
   }
 
@@ -269,6 +325,7 @@ class TaskMetrics private[spark] () extends Serializable {
 
 
 private[spark] object TaskMetrics extends Logging {
+
   import InternalAccumulator._
 
   /**

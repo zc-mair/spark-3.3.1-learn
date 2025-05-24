@@ -40,8 +40,8 @@ object DataReadMethod extends Enumeration with Serializable {
  */
 @DeveloperApi
 class InputMetrics private[spark] () extends Serializable {
-  private[executor] val _bytesRead = new LongAccumulator
-  private[executor] val _recordsRead = new LongAccumulator
+  private[executor] val _bytesRead = new LongAccumulator  // 累计读取字节数
+  private[executor] val _recordsRead = new LongAccumulator // 累计记录条数（如HDFS文件行数/Kafka消息数）
 
   /**
    * Total number of bytes read.

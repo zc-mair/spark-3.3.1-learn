@@ -95,7 +95,7 @@ private[spark] class ShuffleMapStage(
    * tasks in the TaskSetManager for the active attempt for the stage (the partitions stored here
    * will always be a subset of the partitions that the TaskSetManager thinks are pending).
    */
-  val pendingPartitions = new HashSet[Int]  //待计算或需重算的分区 ID（容错关键）
+  val pendingPartitions = new HashSet[Int]  //待计算或需重算的分区 ID（容错关键），用于 ‌跟踪当前 Stage 尝试（attempt）中尚未完成计算的分区‌。
 
   override def toString: String = "ShuffleMapStage " + id
 

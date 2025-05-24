@@ -42,7 +42,7 @@ private[spark] case class AccumulatorMetadata(
  * (e.g., synchronized collections) because it will be read from other threads.
  */
 abstract class AccumulatorV2[IN, OUT] extends Serializable {
-  private[spark] var metadata: AccumulatorMetadata = _
+  private[spark] var metadata: AccumulatorMetadata = _ //AccumulatorMetadata 是 Spark 中管理累加器（Accumulator）的核心元数据类
   private[this] var atDriverSide = true
 
   private[spark] def register(
@@ -52,9 +52,11 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
     if (this.metadata != null) {
       throw new IllegalStateException("Cannot register an Accumulator twice.")
     }
-    this.metadata = AccumulatorMetadata(AccumulatorContext.newId(), name, countFailedValues)
-    AccumulatorContext.register(this)
-    sc.cleaner.foreach(_.registerAccumulatorForCleanup(this))
+    this.metadata = AccumulatorMetadata(AccumulatorContext.newId() // 生成全局唯一ID
+      , name  // 可读性标识（UI显示用）
+      , countFailedValues) // 是否统计失败任务
+    AccumulatorContext.register(this) //将累加器注册到全局上下文
+    sc.cleaner.foreach(_.registerAccumulatorForCleanup(this)) //注册清理：确保任务结束时释放资源
   }
 
   /**
